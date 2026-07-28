@@ -1,8 +1,9 @@
 'use client';
 
-import { useMemo } from 'react';
-import { Ban } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Ban, LineChart, Bot } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { BotPanel } from './bot-panel';
 import { Footer } from '@/components/custom/footer';
 import { Header } from '@/components/custom/header';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -143,6 +144,7 @@ export function DigitsView({
   onReorder,
 }: DigitsViewProps) {
   const isMobile = useIsMobile();
+  const [activePanel, setActivePanel] = useState<'manual' | 'bot'>('manual');
 
   // In edit mode, login/sign-up/account actions are inert (no OAuth navigation
   // out of the editor) — only the theme toggle stays interactive.
