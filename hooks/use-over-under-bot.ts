@@ -2,13 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { DerivWS, Tick } from '@deriv/core';
+import { getLastDigit } from '@/lib/digit-stats';
 
 /**
  * "Over 2 / Under 7" martingale strategy runner (imported from the Deriv DBot
  * XML). Drives real trades imperatively on the shared authenticated WebSocket:
  *
- *   - Each tick, arm `touchedLow` when the last digit is 0/1/2 and `touchedHigh`
- *     when it is 7/8/9.
+ *   - Each R_100 tick, arm `touchedLow` when the last digit is 0/1/2 and
+ *     `touchedHigh` when it is 7/8/9.
  *   - When armed low and a later digit is > 2 → buy DIGITOVER (barrier 2).
  *   - When armed high and a later digit is < 7 → buy DIGITUNDER (barrier 7).
  *   - After a win, reset the stake to the initial stake. After a loss, multiply
@@ -17,6 +18,9 @@ import type { DerivWS, Tick } from '@deriv/core';
  *
  * Contracts are 1-tick digit contracts. The runner waits for each contract to
  * settle (proposal_open_contract → is_sold) before scanning for the next entry.
+ *
+ * The bot always trades Volatility 100 (R_100) regardless of which symbol the
+ * rest of the page is showing, so it maintains its own R_100 tick stream.
  */
 
 export const OVER_UNDER_BOT_SYMBOL = 'R_100';
@@ -58,16 +62,11 @@ interface UseOverUnderBotParams {
   isConnected: boolean;
   isAuthenticated: boolean;
   currency: string;
-  /** Last digit of the most recent tick for the traded symbol. */
-  lastDigit: number | null;
-  /** The current tick object — changes on every tick, used to drive the loop. */
-  currentTick: Tick | null;
 }
 
 interface RuntimeState {
   touchedLow: boolean;
   touchedHigh: boolean;
-  prediction: number;
   stake: number;
   /** 'idle' = scanning ticks for an entry, 'busy' = a contract is in flight. */
   phase: 'idle' | 'busy';
@@ -80,8 +79,6 @@ export function useOverUnderBot({
   isConnected,
   isAuthenticated,
   currency,
-  lastDigit,
-  currentTick,
 }: UseOverUnderBotParams) {
   const [isRunning, setIsRunning] = useState(false);
   const [settings, setSettings] = useState<BotSettings>(DEFAULT_BOT_SETTINGS);
@@ -93,25 +90,25 @@ export function useOverUnderBot({
     totalProfit: 0,
   });
   const [log, setLog] = useState<BotLogEntry[]>([]);
+  /** Most recent R_100 digit, surfaced to the UI so users see the live feed. */
+  const [lastDigit, setLastDigit] = useState<number | null>(null);
 
   const runningRef = useRef(false);
   const settingsRef = useRef(settings);
-  const lastDigitRef = useRef<number | null>(lastDigit);
   const runtime = useRef<RuntimeState>({
     touchedLow: false,
     touchedHigh: false,
-    prediction: 2,
     stake: DEFAULT_BOT_SETTINGS.initialStake,
     phase: 'idle',
   });
 
+  // Cleanup handles for the R_100 tick stream (dedicated sub + global fallback).
+  const tickUnsubRef = useRef<(() => void) | null>(null);
+  const globalUnsubRef = useRef<(() => void) | null>(null);
+
   useEffect(() => {
     settingsRef.current = settings;
   }, [settings]);
-
-  useEffect(() => {
-    lastDigitRef.current = lastDigit;
-  }, [lastDigit]);
 
   const addLog = useCallback((type: BotLogType, message: string) => {
     setLog((prev) =>
@@ -137,8 +134,9 @@ export function useOverUnderBot({
         }
         let settled = false;
         ws.subscribe({ proposal_open_contract: 1, contract_id: contractId }, (data) => {
-          const poc = (data as { proposal_open_contract?: { is_sold?: number; profit?: number | string } })
-            .proposal_open_contract;
+          const poc = (
+            data as { proposal_open_contract?: { is_sold?: number; profit?: number | string } }
+          ).proposal_open_contract;
           if (!poc || settled) return;
           if (poc.is_sold === 1) {
             settled = true;
@@ -146,9 +144,9 @@ export function useOverUnderBot({
           }
         })
           .then((sub) => {
-            if (settled) sub.unsubscribe();
-            else {
-              // Poll guard: once resolved elsewhere, ensure we clean up.
+            if (settled) {
+              sub.unsubscribe();
+            } else {
               const cleanup = setInterval(() => {
                 if (settled) {
                   clearInterval(cleanup);
@@ -187,7 +185,7 @@ export function useOverUnderBot({
           duration: 1,
           duration_unit: 't',
           underlying_symbol: OVER_UNDER_BOT_SYMBOL,
-          barrier: String(barrier),
+          barrier,
         });
 
         const proposal = proposalResp.proposal;
@@ -222,9 +220,9 @@ export function useOverUnderBot({
 
         addLog(
           won ? 'win' : 'loss',
-          `${won ? 'Won' : 'Lost'} ${label} · ${profit >= 0 ? '+' : ''}${profit.toFixed(2)} ${currency} · next stake ${round2(
-            rt.stake
-          ).toFixed(2)} ${currency}`
+          `${won ? 'Won' : 'Lost'} ${label} · ${profit >= 0 ? '+' : ''}${profit.toFixed(
+            2
+          )} ${currency} · next stake ${round2(rt.stake).toFixed(2)} ${currency}`
         );
       } catch (err) {
         addLog('error', err instanceof Error ? err.message : 'Trade failed');
@@ -238,36 +236,78 @@ export function useOverUnderBot({
     [ws, currency, addLog, waitForSettlement]
   );
 
-  /** Evaluate the strategy against the latest digit (runs once per tick). */
-  const processTick = useCallback(() => {
-    const digit = lastDigitRef.current;
+  const fireTradeRef = useRef(fireTrade);
+  useEffect(() => {
+    fireTradeRef.current = fireTrade;
+  }, [fireTrade]);
+
+  /** Evaluate the strategy against the latest R_100 digit (once per tick). */
+  const processDigit = useCallback((digit: number) => {
+    setLastDigit(digit);
     const rt = runtime.current;
-    if (!runningRef.current || rt.phase !== 'idle' || digit === null) return;
+    if (!runningRef.current || rt.phase !== 'idle') return;
 
     if (digit === 0 || digit === 1 || digit === 2) rt.touchedLow = true;
     if (digit === 7 || digit === 8 || digit === 9) rt.touchedHigh = true;
 
     if (rt.touchedLow && digit > 2) {
-      rt.prediction = 2;
       rt.touchedLow = false;
-      void fireTrade('DIGITOVER', 2);
+      void fireTradeRef.current('DIGITOVER', 2);
     } else if (rt.touchedHigh && digit < 7) {
-      rt.prediction = 7;
       rt.touchedHigh = false;
-      void fireTrade('DIGITUNDER', 7);
+      void fireTradeRef.current('DIGITUNDER', 7);
     }
-  }, [fireTrade]);
+  }, []);
 
-  const processTickRef = useRef(processTick);
+  // Maintain a live R_100 tick stream whenever connected. A dedicated
+  // subscription feeds digits; if R_100 is already subscribed elsewhere the
+  // subscribe call errors, so we fall back to a global message listener that
+  // filters the shared stream for R_100 ticks.
   useEffect(() => {
-    processTickRef.current = processTick;
-  }, [processTick]);
+    if (!ws || !isConnected) return;
+    let disposed = false;
 
-  // Drive the strategy off every new tick.
-  useEffect(() => {
-    if (!currentTick) return;
-    processTickRef.current();
-  }, [currentTick]);
+    const handleTick = (tick: Tick) => {
+      if (disposed || tick.symbol !== OVER_UNDER_BOT_SYMBOL) return;
+      const pipSize = tick.pip_size ?? 2;
+      processDigit(getLastDigit(tick.quote, pipSize));
+    };
+
+    // Global fallback: catches R_100 ticks regardless of who owns the stream.
+    globalUnsubRef.current = ws.onMessage((data) => {
+      const tick = (data as { tick?: Tick }).tick;
+      if (tick) handleTick(tick);
+    });
+
+    ws
+      .subscribe({ ticks: OVER_UNDER_BOT_SYMBOL }, (data) => {
+        const tick = (data as { tick?: Tick }).tick;
+        if (tick) handleTick(tick);
+      })
+      .then((sub) => {
+        if (disposed) {
+          sub.unsubscribe();
+          return;
+        }
+        tickUnsubRef.current = sub.unsubscribe;
+      })
+      .catch(() => {
+        // Already subscribed (e.g. the page is on R_100) — the global
+        // listener above will keep feeding digits, so this is non-fatal.
+      });
+
+    return () => {
+      disposed = true;
+      if (tickUnsubRef.current) {
+        tickUnsubRef.current();
+        tickUnsubRef.current = null;
+      }
+      if (globalUnsubRef.current) {
+        globalUnsubRef.current();
+        globalUnsubRef.current = null;
+      }
+    };
+  }, [ws, isConnected, processDigit]);
 
   const start = useCallback(() => {
     if (!isAuthenticated) {
@@ -282,7 +322,6 @@ export function useOverUnderBot({
     runtime.current = {
       touchedLow: false,
       touchedHigh: false,
-      prediction: 2,
       stake: cfg.initialStake,
       phase: 'idle',
     };
@@ -291,9 +330,9 @@ export function useOverUnderBot({
     setIsRunning(true);
     addLog(
       'info',
-      `Bot started on Volatility 100 · initial ${cfg.initialStake.toFixed(2)} ${currency} · ${cfg.multiplier}x martingale · cap ${(
-        cfg.initialStake * cfg.maxStakeMultiple
-      ).toFixed(2)} ${currency}`
+      `Bot started on Volatility 100 · initial ${cfg.initialStake.toFixed(2)} ${currency} · ${
+        cfg.multiplier
+      }x martingale · cap ${(cfg.initialStake * cfg.maxStakeMultiple).toFixed(2)} ${currency}`
     );
   }, [isAuthenticated, isConnected, currency, addLog]);
 
@@ -330,6 +369,7 @@ export function useOverUnderBot({
     setSettings,
     stats,
     log,
+    lastDigit,
     start,
     stop,
     resetStats,

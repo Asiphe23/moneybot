@@ -17,8 +17,6 @@ interface BotPanelProps {
   isConnected: boolean;
   isAuthenticated: boolean;
   currency: string;
-  lastDigit: number | null;
-  currentTick: import('@deriv/core').Tick | null;
 }
 
 const LOG_STYLES: Record<BotLogType, string> = {
