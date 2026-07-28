@@ -1,8 +1,9 @@
 'use client';
 
-import { useMemo } from 'react';
-import { Ban } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Ban, LineChart, Bot } from 'lucide-react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { BotPanel } from './bot-panel';
 import { Footer } from '@/components/custom/footer';
 import { Header } from '@/components/custom/header';
 import { Skeleton } from '@/components/ui/skeleton';
@@ -143,6 +144,7 @@ export function DigitsView({
   onReorder,
 }: DigitsViewProps) {
   const isMobile = useIsMobile();
+  const [activePanel, setActivePanel] = useState<'manual' | 'bot'>('manual');
 
   // In edit mode, login/sign-up/account actions are inert (no OAuth navigation
   // out of the editor) — only the theme toggle stays interactive.
@@ -256,7 +258,55 @@ export function DigitsView({
       {/* Spacer to push content below fixed header — taller when authenticated (account bar visible) */}
       <div className={authState === 'authenticated' ? 'h-[76px] shrink-0' : 'h-[66px] shrink-0'} />
 
-      {appConfig ? (
+      {/* Top-level mode switch: manual trading vs the automated Over/Under bot. */}
+      {!editMode && (
+        <div className="mx-auto w-full max-w-2xl px-3 pt-2 sm:px-4">
+          <div className="inline-flex items-center gap-1 rounded-full bg-muted p-1">
+            <button
+              type="button"
+              onClick={() => setActivePanel('manual')}
+              aria-pressed={activePanel === 'manual'}
+              className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                activePanel === 'manual'
+                  ? 'bg-background text-primary font-bold shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <LineChart className="h-4 w-4" aria-hidden="true" />
+              Manual
+            </button>
+            <button
+              type="button"
+              onClick={() => setActivePanel('bot')}
+              aria-pressed={activePanel === 'bot'}
+              className={`inline-flex items-center gap-1.5 rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+                activePanel === 'bot'
+                  ? 'bg-background text-primary font-bold shadow-sm'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <Bot className="h-4 w-4" aria-hidden="true" />
+              Bot
+            </button>
+          </div>
+        </div>
+      )}
+
+      {!editMode && activePanel === 'bot' ? (
+        <div className="mx-auto w-full max-w-2xl px-3 py-3 pb-24 sm:px-4">
+          <Card className="border shadow-sm">
+            <CardContent className="p-3 pt-4 sm:p-6">
+              <BotPanel
+                isConnected={isConnected}
+                isAuthenticated={authState === 'authenticated'}
+                currency={activeAccount?.currency ?? 'USD'}
+                lastDigit={lastDigit}
+                currentTick={currentTick}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      ) : appConfig ? (
         isMobile ? (
           /* No-code mobile layout: a single, reorderable column of blocks. */
           <div className="flex-1 min-h-0 overflow-y-auto overscroll-contain">
